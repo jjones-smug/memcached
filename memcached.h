@@ -495,6 +495,9 @@ struct settings {
 #ifdef PROXY
     bool proxy_enabled;
     char *proxy_startfile; /* lua file to run when workers start */
+    void *proxy_state; /* ptr to proxy's lua config state */
+    void *proxy_code; /* worker code dump */
+    void *proxy_threads; /* backend threads */
 #endif
 };
 
@@ -643,6 +646,7 @@ typedef struct {
     void *L;
     int proxy_hook; // TODO: temporary, probably unused.
     int proxy_attach_ref; // TODO: temporary single callback value :)
+    // TODO: add ctx object so we can attach to queue.
 #endif
 } LIBEVENT_THREAD;
 
