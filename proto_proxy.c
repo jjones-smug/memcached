@@ -2180,10 +2180,10 @@ static int mcplib_hash_selector(lua_State *L) {
             // this?
             lua_pushinteger(L, x);
             lua_setfield(L, -2, "id");
-            // TODO: need to get hostname (Separate from logical name?)
-            // into the backend objects somehow.
-            lua_pushstring(L, "unknown");
-            lua_setfield(L, -2, "thing");
+            // we don't use the hostname for ketama hashing
+            // so passing ip for hostname is fine
+            lua_pushstring(L, be->ip);
+            lua_setfield(L, -2, "hostname");
             lua_pushstring(L, be->ip);
             lua_setfield(L, -2, "addr");
             lua_pushstring(L, be->port);
