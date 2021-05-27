@@ -3760,6 +3760,9 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
         settings.sig_hup = false;
 
         authfile_load(settings.auth_file);
+#ifdef PROXY
+        proxy_start_reload(settings.proxy_ctx);
+#endif
     }
 
     evtimer_set(&clockevent, clock_handler, 0);
@@ -5800,6 +5803,9 @@ int main (int argc, char **argv) {
 #ifdef PROXY
     if (settings.proxy_enabled) {
         proxy_init();
+        if (proxy_load_config(settings.proxy_ctx) != 0) {
+            exit(EXIT_FAILURE);
+        }
     }
 #endif
 #ifdef EXTSTORE

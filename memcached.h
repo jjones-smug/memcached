@@ -495,9 +495,7 @@ struct settings {
 #ifdef PROXY
     bool proxy_enabled;
     char *proxy_startfile; /* lua file to run when workers start */
-    void *proxy_state; /* ptr to proxy's lua config state */
-    void *proxy_code; /* worker code dump */
-    void *proxy_threads; /* backend threads */
+    void *proxy_ctx; /* proxy's state context */
 #endif
 };
 
@@ -926,6 +924,7 @@ void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
+LIBEVENT_THREAD *get_worker_thread(int id);
 
 /* Stat processing functions */
 void append_stat(const char *name, ADD_STAT add_stats, conn *c,

@@ -101,7 +101,6 @@ function mcp_config_selectors(oldss)
         end
     end
 
-
     return main_zones
 end
 

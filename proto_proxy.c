@@ -101,6 +101,22 @@ enum proxy_cmd_types {
     CMD_TYPE_META, // m*'s.
 };
 
+typedef struct _io_pending_proxy_t io_pending_proxy_t;
+typedef struct proxy_event_thread_s proxy_event_thread_t;
+
+typedef struct {
+    lua_State *proxy_state;
+    void *proxy_code;
+    proxy_event_thread_t *proxy_threads;
+    pthread_mutex_t config_lock;
+    pthread_cond_t config_cond;
+    pthread_t config_tid;
+    pthread_mutex_t worker_lock;
+    pthread_cond_t worker_cond;
+    bool worker_done; // signal variable for the worker lock/cond system.
+    bool worker_failed; // covered by worker_lock as well.
+} proxy_ctx_t;
+
 struct proxy_hook {
     // TODO: C func ptr. If non-null, call directly instead of via lua.
     int lua_ref;
@@ -118,9 +134,6 @@ static uint32_t mcplib_hashfunc_murmur3_func(const void *key, size_t len, void *
     return MurmurHash3_x86_32(key, len);
 }
 static struct proxy_hash_caller mcplib_hashfunc_murmur3 = { mcplib_hashfunc_murmur3_func, NULL};
-
-typedef struct _io_pending_proxy_t io_pending_proxy_t;
-typedef struct proxy_event_thread_s proxy_event_thread_t;
 
 enum mcp_backend_states {
     mcp_backend_read = 0, // waiting to read any response
@@ -292,6 +305,7 @@ static void proxy_out_errstring(mc_resp *resp, const char *str);
 static int _flush_pending_write(mcp_backend_t *be, io_pending_proxy_t *p);
 static int _reset_bad_backend(mcp_backend_t *be);
 static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t);
+static int proxy_thread_loadconf(LIBEVENT_THREAD *thr);
 
 /******** EXTERNAL FUNCTIONS ******/
 // functions starting with _ are breakouts for the public functions.
@@ -330,30 +344,113 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
     return db->buf;
 }
 
+void proxy_start_reload(void *arg) {
+    proxy_ctx_t *ctx = arg;
+    if (pthread_mutex_trylock(&ctx->config_lock) == 0) {
+        pthread_cond_signal(&ctx->config_cond);
+        pthread_mutex_unlock(&ctx->config_lock);
+    }
+}
+
+// Thread handling the configuration reload sequence.
+// TODO: get a logger instance.
+// TODO: making this "safer" will require a few phases of work.
+// 1) JFDI
+// 2) "test VM" -> from config thread, test the worker reload portion.
+// 3) "unit testing" -> from same temporary worker VM, execute set of
+// integration tests that must pass.
+// 4) run update on each worker, collecting new mcp.attach() hooks.
+//    Once every worker has successfully executed and set new hooks, roll
+//    through a _second_ time to actually swap the hook structures and unref
+//    the old structures where marked dirty.
+static void *_proxy_config_thread(void *arg) {
+    proxy_ctx_t *ctx = arg;
+
+    pthread_mutex_lock(&ctx->config_lock);
+    while (1) {
+        pthread_cond_wait(&ctx->config_cond, &ctx->config_lock);
+        lua_State *L = ctx->proxy_state;
+        lua_settop(L, 0); // clear off any crud that could have been left on the stack.
+
+        // The main stages of config reload are:
+        // - load and execute the config file
+        // - run mcp_config_selectors()
+        // - for each worker:
+        //   - copy and execute new lua code
+        //   - copy selector table
+        //   - run mcp_config_routes()
+
+        if (proxy_load_config(ctx) != 0) {
+            // TODO: Failed to load. log and wait for a retry.
+            continue;
+        }
+
+        // TODO: create a temporary VM to test-load the worker code into.
+        // failing to load partway through the worker VM reloads can be
+        // critically bad if we're not careful about references.
+        // IE: the config VM _must_ hold references to selectors and backends
+        // as long as they exist in any worker for any reason.
+
+        char buf[1];
+        buf[0] = 'P';
+        for (int x = 0; x < settings.num_threads; x++) {
+            LIBEVENT_THREAD *thr = get_worker_thread(x);
+
+            pthread_mutex_lock(&ctx->worker_lock);
+            ctx->worker_done = false;
+            ctx->worker_failed = false;
+            if (write(thr->notify_send_fd, buf, 1) != 1) {
+                perror("Failed writing to nofiy pipe");
+                pthread_mutex_unlock(&ctx->worker_lock);
+                continue;
+            }
+            while (!ctx->worker_done) {
+                // in case of spurious wakeup.
+                pthread_cond_wait(&ctx->worker_cond, &ctx->worker_lock);
+            }
+            pthread_mutex_unlock(&ctx->worker_lock);
+
+            // Code load bailed.
+            if (ctx->worker_failed) {
+                continue;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int _start_proxy_config_thread(proxy_ctx_t *ctx) {
+    int ret;
+
+    pthread_mutex_lock(&ctx->config_lock);
+    if ((ret = pthread_create(&ctx->config_tid, NULL,
+                    _proxy_config_thread, ctx)) != 0) {
+        fprintf(stderr, "Failed to start proxy configuration thread: %s\n",
+                strerror(ret));
+        pthread_mutex_unlock(&ctx->config_lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&ctx->config_lock);
+
+    return 0;
+}
+
 // start the centralized lua state and config thread.
+// TODO: return ctx/state. avoid global vars.
 void proxy_init(void) {
+    proxy_ctx_t *ctx = calloc(1, sizeof(proxy_ctx_t));
+    settings.proxy_ctx = ctx; // FIXME: return and deal with outside?
+
+    pthread_mutex_init(&ctx->config_lock, NULL);
+    pthread_cond_init(&ctx->config_cond, NULL);
+    pthread_mutex_init(&ctx->worker_lock, NULL);
+    pthread_cond_init(&ctx->worker_cond, NULL);
     lua_State *L = luaL_newstate();
-    settings.proxy_state = L;
+    ctx->proxy_state = L;
     luaL_openlibs(L);
     // NOTE: might need to differentiate the libs yes?
     proxy_register_libs(NULL, L);
-
-    int res = luaL_loadfile(L, settings.proxy_startfile);
-    if (res != LUA_OK) {
-        fprintf(stderr, "Failed to load proxy_startfile: %s\n", lua_tostring(L, -1));
-        exit(EXIT_FAILURE);
-    }
-    // LUA_OK, LUA_ERRSYNTAX, LUA_ERRMEM, LUA_ERRFILE
-
-    // Now we need to dump the compiled code into bytecode.
-    // This will then get loaded into worker threads.
-    struct _dumpbuf *db = malloc(sizeof(struct _dumpbuf));
-    db->size = 16384;
-    db->used = 0;
-    db->buf = malloc(db->size);
-    lua_dump(L, _dump_helper, db, 0);
-    // 0 means no error.
-    settings.proxy_code = db;
 
     // Create/start the backend threads, which we need before servers
     // start getting created.
@@ -361,7 +458,7 @@ void proxy_init(void) {
     // low number of N to avoid too many wakeup syscalls.
     // For now we hardcode to 1.
     proxy_event_thread_t *threads = calloc(1, sizeof(proxy_event_thread_t));
-    settings.proxy_threads = threads;
+    ctx->proxy_threads = threads;
     for (int i = 0; i < 1; i++) {
         proxy_event_thread_t *t = &threads[i];
 #ifdef USE_EVENTFD
@@ -411,10 +508,33 @@ void proxy_init(void) {
         pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
     }
 
+    _start_proxy_config_thread(ctx);
+}
+
+int proxy_load_config(void *arg) {
+    proxy_ctx_t *ctx = arg;
+    lua_State *L = ctx->proxy_state;
+    int res = luaL_loadfile(L, settings.proxy_startfile);
+    if (res != LUA_OK) {
+        fprintf(stderr, "Failed to load proxy_startfile: %s\n", lua_tostring(L, -1));
+        return -1;
+    }
+    // LUA_OK, LUA_ERRSYNTAX, LUA_ERRMEM, LUA_ERRFILE
+
+    // Now we need to dump the compiled code into bytecode.
+    // This will then get loaded into worker threads.
+    struct _dumpbuf *db = malloc(sizeof(struct _dumpbuf));
+    db->size = 16384;
+    db->used = 0;
+    db->buf = malloc(db->size);
+    lua_dump(L, _dump_helper, db, 0);
+    // 0 means no error.
+    ctx->proxy_code = db;
+
     // now we complete the data load by calling the function.
     res = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (res != LUA_OK) {
-        fprintf(stderr, "Failed to load data into L: %s\n", lua_tostring(L, -1));
+        fprintf(stderr, "Failed to load data into lua config state: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
     }
 
@@ -429,6 +549,7 @@ void proxy_init(void) {
     }
 
     // result is our main config.
+    return 0;
 }
 
 // TODO: this will be done differently while implementing config reloading.
@@ -524,6 +645,53 @@ static void _copy_config_table(lua_State *from, lua_State *to) {
     }
 }
 
+// Run from proxy worker to coordinate code reload.
+// config_lock must be held first.
+void proxy_worker_reload(void *arg, LIBEVENT_THREAD *thr) {
+    proxy_ctx_t *ctx = arg;
+    pthread_mutex_lock(&ctx->worker_lock);
+    if (proxy_thread_loadconf(thr) != 0) {
+        ctx->worker_failed = true;
+    }
+    ctx->worker_done = true;
+    pthread_cond_signal(&ctx->worker_cond);
+    pthread_mutex_unlock(&ctx->worker_lock);
+}
+
+// FIXME: need to test how to recover from an actual error here. stuff gets
+// left on the stack?
+static int proxy_thread_loadconf(LIBEVENT_THREAD *thr) {
+    lua_State *L = thr->L;
+    // load the precompiled config function.
+    proxy_ctx_t *ctx = settings.proxy_ctx;
+    struct _dumpbuf *db = ctx->proxy_code;
+    struct _dumpbuf db2; // copy because the helper modifies it.
+    memcpy(&db2, db, sizeof(struct _dumpbuf));
+
+    lua_load(L, _load_helper, &db2, "config", NULL);
+    // LUA_OK + all errs from loadfile except LUA_ERRFILE.
+    //dump_stack(L);
+    // - pcall the func (which should load it)
+    int res = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (res != LUA_OK) {
+        // FIXME: no crazy failure here!
+        fprintf(stderr, "Failed to load data into worker thread\n");
+        return -1;
+    }
+
+    lua_getglobal(L, "mcp_config_routes");
+    // create deepcopy of argument to pass into mcp_config_routes.
+    _copy_config_table(ctx->proxy_state, L);
+
+    // copied value is in front of route function, now call it.
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
+        return -1;
+    }
+
+    return 0;
+}
+
 // Initialize the VM for an individual worker thread.
 void proxy_thread_init(LIBEVENT_THREAD *thr) {
     // Create the hook table.
@@ -539,35 +707,15 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
     luaL_openlibs(L);
     proxy_register_libs(thr, L);
 
-    // load the precompiled config function.
-    struct _dumpbuf *db = settings.proxy_code;
-    struct _dumpbuf db2; // copy because the helper modifies it.
-    memcpy(&db2, db, sizeof(struct _dumpbuf));
-
-    lua_load(L, _load_helper, &db2, "config", NULL);
-    // LUA_OK + all errs from loadfile except LUA_ERRFILE.
-    //dump_stack(L);
-    // - pcall the func (which should load it)
-    int res = lua_pcall(L, 0, LUA_MULTRET, 0);
-    if (res != LUA_OK) {
-        fprintf(stderr, "Failed to load data into L2\n");
-        exit(EXIT_FAILURE);
-    }
-
-    lua_getglobal(L, "mcp_config_routes");
-    // create deepcopy of argument to pass into mcp_config_routes.
-    _copy_config_table((lua_State *)settings.proxy_state, L);
-
-    // copied value is in front of route function, now call it.
-    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-        fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
+    // kick off the configuration.
+    if (proxy_thread_loadconf(thr) != 0) {
         exit(EXIT_FAILURE);
     }
 }
 
 // ctx_stack is a stack of io_pending_proxy_t's.
 void proxy_submit_cb(void *ctx, void *ctx_stack) {
-    proxy_event_thread_t *e = ctx;
+    proxy_event_thread_t *e = ((proxy_ctx_t *)ctx)->proxy_threads;
     io_pending_proxy_t *p = ctx_stack;
     io_head_t head;
     STAILQ_INIT(&head);

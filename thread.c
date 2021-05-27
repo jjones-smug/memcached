@@ -553,7 +553,7 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
 #endif
 #ifdef PROXY
-                    conn_io_queue_add(c, IO_QUEUE_PROXY, settings.proxy_threads, proxy_submit_cb,
+                    conn_io_queue_add(c, IO_QUEUE_PROXY, settings.proxy_ctx, proxy_submit_cb,
                             proxy_complete_cb, proxy_finalize_cb);
 #endif
                     conn_io_queue_add(c, IO_QUEUE_NONE, NULL, NULL, NULL, NULL);
@@ -595,7 +595,18 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
     case 's':
         event_base_loopexit(me->base, NULL);
         break;
+#ifdef PROXY
+    case 'P':
+        proxy_worker_reload(settings.proxy_ctx, me);
+        break;
+#endif
     }
+}
+
+// NOTE: need better encapsulation.
+// used by the proxy module to iterate the worker threads.
+LIBEVENT_THREAD *get_worker_thread(int id) {
+    return &threads[id];
 }
 
 /* Which thread we assigned a connection to most recently. */
