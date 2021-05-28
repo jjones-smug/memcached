@@ -41,6 +41,7 @@
 
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
+#define MCP_BACKEND_UPVALUE 3
 
 // NOTE: unused right now.
 //#define PROXY_EVENT_IO_THREADS 4
@@ -1988,7 +1989,11 @@ __attribute__((unused)) static void dump_stack(lua_State *L) {
             }
             lua_pop(L, 2);
         }
-        fprintf(stderr, "--|%d| [%s]\n", i, lua_typename(L, type));
+        if (type == LUA_TSTRING) {
+            fprintf(stderr, "--|%d| [%s] | %s\n", i, lua_typename(L, type), lua_tostring(L, i));
+        } else {
+            fprintf(stderr, "--|%d| [%s]\n", i, lua_typename(L, type));
+        }
     }
     fprintf(stderr, "-----------------\n");
 }
@@ -2040,9 +2045,28 @@ static int mcplib_backend_gc(lua_State *L) {
 }
 
 static int mcplib_backend(lua_State *L) {
+    luaL_checkstring(L, -4); // label for indexing backends.
     const char *ip = luaL_checkstring(L, -3); // FIXME: checklstring?
     const char *port = luaL_checkstring(L, -2);
     double weight = luaL_checknumber(L, -1);
+
+    // first check our reference table to compare.
+    lua_pushvalue(L, -4);
+    int ret = lua_gettable(L, lua_upvalueindex(MCP_BACKEND_UPVALUE));
+    if (ret != LUA_TNIL) {
+        mcp_backend_t *be_orig = luaL_checkudata(L, -1, "mcp.backend");
+        if (strncmp(be_orig->ip, ip, MAX_IPLEN) == 0
+                && strncmp(be_orig->port, port, MAX_PORTLEN) == 0
+                && be_orig->weight == weight) {
+            // backend is the same, return it.
+            return 1;
+        } else {
+            // backend not the same, pop from stack and make new one.
+            lua_pop(L, 1);
+        }
+    } else {
+        lua_pop(L, 1);
+    }
 
     // This might shift to internal objects?
     mcp_backend_t *be = lua_newuserdatauv(L, sizeof(mcp_backend_t), 0);
@@ -2089,6 +2113,12 @@ static int mcplib_backend(lua_State *L) {
 
     luaL_getmetatable(L, "mcp.backend");
     lua_setmetatable(L, -2); // set metatable to userdata.
+
+    lua_pushvalue(L, 1); // put the label at the top for settable later.
+    lua_pushvalue(L, -2); // copy the backend reference to the top.
+    // set our new backend object into the reference table.
+    lua_settable(L, lua_upvalueindex(MCP_BACKEND_UPVALUE));
+    // stack is back to having backend on the top.
 
     return 1;
 }
@@ -2830,7 +2860,14 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     lua_pushlightuserdata(L, (void *)t); // upvalue for original thread
     lua_newtable(L); // upvalue for mcp.attach() table.
 
-    luaL_setfuncs(L, mcplib_f, 2); // 2 upvalues.
+    // create weak table for storing backends by label.
+    lua_newtable(L); // {}
+    lua_newtable(L); // {}, {} for metatable
+    lua_pushstring(L, "v"); // {}, {}, "v" for weak values.
+    lua_setfield(L, -2, "__mode"); // {}, {__mode = "v"}
+    lua_setmetatable(L, -2); // {__mt = {__mode = "v"} }
+
+    luaL_setfuncs(L, mcplib_f, 3); // store upvalues.
 
     lua_setglobal(L, "mcp"); // set the lib table to mcp global.
     return 1;
