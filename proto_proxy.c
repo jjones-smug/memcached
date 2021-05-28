@@ -104,6 +104,7 @@ enum proxy_cmd_types {
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
 
+typedef STAILQ_HEAD(hs_head_s, mcp_hash_selector_s) hs_head_t;
 typedef struct {
     lua_State *proxy_state;
     void *proxy_code;
@@ -113,6 +114,10 @@ typedef struct {
     pthread_t config_tid;
     pthread_mutex_t worker_lock;
     pthread_cond_t worker_cond;
+    pthread_t manager_tid; // deallocation management thread
+    pthread_mutex_t manager_lock;
+    pthread_cond_t manager_cond;
+    hs_head_t manager_head; // stack for hash selector deallocation.
     bool worker_done; // signal variable for the worker lock/cond system.
     bool worker_failed; // covered by worker_lock as well.
 } proxy_ctx_t;
@@ -279,15 +284,22 @@ typedef struct {
     mcp_backend_t *be;
 } mcp_hash_selector_be_t;
 
-// TODO: hash/compare func ptr
-// void *ctx
-// ctx_ref?
-typedef struct {
-    struct proxy_hash_caller *phc;
+typedef struct mcp_hash_selector_s mcp_hash_selector_t;
+struct mcp_hash_selector_s {
+    struct proxy_hash_caller phc;
+    pthread_mutex_t lock; // protects refcount.
+    proxy_ctx_t *ctx; // main context.
+    STAILQ_ENTRY(mcp_hash_selector_s) next; // stack for deallocator.
+    int refcount;
     int phc_ref;
+    int self_ref; // TODO: double check that this is needed.
     int pool_size;
     mcp_hash_selector_be_t pool[];
-} mcp_hash_selector_t;
+};
+
+typedef struct {
+    mcp_hash_selector_t *main; // ptr to original
+} mcp_hash_selector_proxy_t;
 
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
 #define PROCESS_MULTIGET true
@@ -350,6 +362,50 @@ void proxy_start_reload(void *arg) {
         pthread_cond_signal(&ctx->config_cond);
         pthread_mutex_unlock(&ctx->config_lock);
     }
+}
+
+// Manages a queue of inbound objects destined to be deallocated.
+static void *_proxy_manager_thread(void *arg) {
+    proxy_ctx_t *ctx = arg;
+    hs_head_t head;
+
+    pthread_mutex_lock(&ctx->manager_lock);
+    while (1) {
+        STAILQ_INIT(&head);
+        while (STAILQ_EMPTY(&ctx->manager_head)) {
+            pthread_cond_wait(&ctx->manager_cond, &ctx->manager_lock);
+        }
+
+        // pull dealloc queue into local queue.
+        STAILQ_CONCAT(&head, &ctx->manager_head);
+        pthread_mutex_unlock(&ctx->manager_lock);
+
+        // Config lock is required for using config VM.
+        pthread_mutex_lock(&ctx->config_lock);
+        lua_State *L = ctx->proxy_state;
+        mcp_hash_selector_t *hs;
+        STAILQ_FOREACH(hs, &head, next) {
+            // walk the hash selector backends and unref.
+            for (int x = 0; x < hs->pool_size; x++) {
+                luaL_unref(L, LUA_REGISTRYINDEX, hs->pool[x].ref);
+            }
+            // unref the phc ref.
+            luaL_unref(L, LUA_REGISTRYINDEX, hs->phc_ref);
+            // need to... unref self.
+            // NOTE: double check if we really need to self-reference.
+            // this is a backup here to ensure the external refcounts hit zero
+            // before lua garbage collects the object. other things hold a
+            // reference to the object though.
+            luaL_unref(L, LUA_REGISTRYINDEX, hs->self_ref);
+            // that's it? let it float?
+        }
+        pthread_mutex_unlock(&ctx->config_lock);
+
+        // done.
+        pthread_mutex_lock(&ctx->manager_lock);
+    }
+
+    return NULL;
 }
 
 // Thread handling the configuration reload sequence.
@@ -420,7 +476,7 @@ static void *_proxy_config_thread(void *arg) {
     return NULL;
 }
 
-static int _start_proxy_config_thread(proxy_ctx_t *ctx) {
+static int _start_proxy_config_threads(proxy_ctx_t *ctx) {
     int ret;
 
     pthread_mutex_lock(&ctx->config_lock);
@@ -432,6 +488,16 @@ static int _start_proxy_config_thread(proxy_ctx_t *ctx) {
         return -1;
     }
     pthread_mutex_unlock(&ctx->config_lock);
+
+    pthread_mutex_lock(&ctx->manager_lock);
+    if ((ret = pthread_create(&ctx->manager_tid, NULL,
+                    _proxy_manager_thread, ctx)) != 0) {
+        fprintf(stderr, "Failed to start proxy configuration thread: %s\n",
+                strerror(ret));
+        pthread_mutex_unlock(&ctx->manager_lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&ctx->manager_lock);
 
     return 0;
 }
@@ -446,6 +512,9 @@ void proxy_init(void) {
     pthread_cond_init(&ctx->config_cond, NULL);
     pthread_mutex_init(&ctx->worker_lock, NULL);
     pthread_cond_init(&ctx->worker_cond, NULL);
+    pthread_mutex_init(&ctx->manager_lock, NULL);
+    pthread_cond_init(&ctx->manager_cond, NULL);
+    STAILQ_INIT(&ctx->manager_head);
     lua_State *L = luaL_newstate();
     ctx->proxy_state = L;
     luaL_openlibs(L);
@@ -508,7 +577,7 @@ void proxy_init(void) {
         pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
     }
 
-    _start_proxy_config_thread(ctx);
+    _start_proxy_config_threads(ctx);
 }
 
 int proxy_load_config(void *arg) {
@@ -555,19 +624,16 @@ int proxy_load_config(void *arg) {
 // TODO: this will be done differently while implementing config reloading.
 static int _copy_hash_selector(lua_State *from, lua_State *to) {
     // from, -3 should have he userdata.
-    mcp_hash_selector_t *ss = luaL_checkudata(from, -3, "mcp.hash_selector");
-    size_t size = sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_be_t) * ss->pool_size;
-    mcp_hash_selector_t *css = lua_newuserdatauv(to, size, 0);
-    luaL_setmetatable(to, "mcp.hash_selector");
-    // TODO: check css.
+    mcp_hash_selector_t *hs = luaL_checkudata(from, -3, "mcp.hash_selector");
+    size_t size = sizeof(mcp_hash_selector_proxy_t);
+    mcp_hash_selector_proxy_t *hsp = lua_newuserdatauv(to, size, 0);
+    luaL_setmetatable(to, "mcp.hash_selector_proxy");
+    // TODO: check hsp.
 
-    // TODO: we just straight copy the references here, pointing at the
-    // mcp.backend's from the config without actually holding proper
-    // references!
-    // This is done today because there's no code reload.
-    // To implement code reload this will need to add references to the
-    // original structure to hold it.
-    memcpy(css, ss, size);
+    hsp->main = hs;
+    pthread_mutex_lock(&hs->lock);
+    hs->refcount++;
+    pthread_mutex_unlock(&hs->lock);
     return 0;
 }
 
@@ -1957,6 +2023,22 @@ static int mcplib_response_gc(lua_State *L) {
     return 0;
 }
 
+static int mcplib_backend_gc(lua_State *L) {
+    mcp_backend_t *be = luaL_checkudata(L, -1, "mcp.backend");
+
+    // TODO: need to validate it's impossible to cause a backend to be garbage
+    // collected while outstanding requests exist.
+    // might need some kind of failsafe here to leak memory and warn instead
+    // of killing the object and crashing? or is that too late since we're in
+    // __gc?
+    assert(STAILQ_EMPTY(&be->io_head));
+
+    mcmc_disconnect(be->client);
+    free(be->client);
+
+    return 0;
+}
+
 static int mcplib_backend(lua_State *L) {
     const char *ip = luaL_checkstring(L, -3); // FIXME: checklstring?
     const char *port = luaL_checkstring(L, -2);
@@ -2011,6 +2093,14 @@ static int mcplib_backend(lua_State *L) {
     return 1;
 }
 
+static int mcplib_hash_selector_gc(lua_State *L) {
+    mcp_hash_selector_t *hs = luaL_checkudata(L, -1, "mcp.hash_selector");
+    assert(hs->refcount == 0);
+    pthread_mutex_destroy(&hs->lock);
+
+    return 0;
+}
+
 // hs = mcp.hash_selector(pool, hashfunc, [option])
 static int mcplib_hash_selector(lua_State *L) {
     int argc = lua_gettop(L);
@@ -2022,13 +2112,17 @@ static int mcplib_hash_selector(lua_State *L) {
     // FIXME: zero the memory? then __gc will fix up server references on
     // errors.
     hs->pool_size = n;
+    hs->refcount = 0;
+    pthread_mutex_init(&hs->lock, NULL);
+    hs->ctx = settings.proxy_ctx; // TODO: store ctx in upvalue.
 
     luaL_setmetatable(L, "mcp.hash_selector");
 
+    lua_pushvalue(L, -1); // dupe self for reference.
+    hs->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     // TODO: ensure to increment refcounts for servers.
     // remember lua arrays are 1 indexed.
-    // TODO: we need a second array with luaL_ref()'s to each of the servers.
-    // or an array of structs which hold ptr's.
     for (int x = 1; x <= n; x++) {
         mcp_hash_selector_be_t *s = &hs->pool[x-1];
         lua_geti(L, 1, x); // get next server into the stack.
@@ -2094,24 +2188,44 @@ static int mcplib_hash_selector(lua_State *L) {
         // TODO: validate response arguments.
         // -1 is lightuserdata ptr to the struct (which must be owned by the
         // userdata), which is later used for internal calls.
-        hs->phc = lua_touserdata(L, -1);
+        struct proxy_hash_caller *phc;
+        phc = lua_touserdata(L, -1);
+        memcpy(&hs->phc, phc, sizeof(*phc));
         lua_pop(L, 1);
-        // -2 was userdata we need to hold a reference to.
+        // -2 was userdata we need to hold a reference to
         hs->phc_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         // UD now popped from stack.
     } else {
         // Use default hash selector if none given.
-        hs->phc = &mcplib_hashfunc_murmur3;
+        hs->phc = mcplib_hashfunc_murmur3;
     }
 
     return 1;
 }
 
+static int mcplib_hash_selector_proxy_gc(lua_State *L) {
+    mcp_hash_selector_proxy_t *hsp = luaL_checkudata(L, -1, "mcp.hash_selector_proxy");
+    mcp_hash_selector_t *hs = hsp->main;
+    pthread_mutex_lock(&hs->lock);
+    hs->refcount--;
+    if (hs->refcount == 0) {
+        proxy_ctx_t *ctx = hs->ctx;
+        pthread_mutex_lock(&ctx->manager_lock);
+        STAILQ_INSERT_TAIL(&ctx->manager_head, hs, next);
+        pthread_cond_signal(&ctx->manager_cond);
+        pthread_mutex_unlock(&ctx->manager_lock);
+    }
+    pthread_mutex_unlock(&hs->lock);
+
+    return 0;
+}
+
 // hashfunc(request) -> backend(request)
 // needs key from request object.
-static int mcplib_hash_selector_call(lua_State *L) {
+static int mcplib_hash_selector_proxy_call(lua_State *L) {
     // internal args are the hash selector (self)
-    mcp_hash_selector_t *ss = luaL_checkudata(L, -2, "mcp.hash_selector");
+    mcp_hash_selector_proxy_t *hsp = luaL_checkudata(L, -2, "mcp.hash_selector_proxy");
+    mcp_hash_selector_t *hs = hsp->main;
     // then request object.
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
 
@@ -2119,23 +2233,23 @@ static int mcplib_hash_selector_call(lua_State *L) {
     // FIXME: indicator for if request actually has a key token or not.
     const char *key = MCP_PARSER_KEY(rq->pr);
     size_t len = rq->pr.klen;
-    uint32_t lookup = ss->phc->selector_func(key, len, ss->phc->ctx);
+    uint32_t lookup = hs->phc.selector_func(key, len, hs->phc.ctx);
 
     // attach the backend to the request object.
     // save CPU cycles over rolling it through lua.
-    if (ss->phc->ctx == NULL) {
+    if (hs->phc.ctx == NULL) {
         // TODO: if NULL, pass in pool_size as ctx?
         // works because the % bit will return an id we can index here.
         // FIXME: temporary? maybe?
         // if no context, what we got back was a hash which we need to modulus
         // against the pool, since the func has no info about the pool.
-        rq->be = ss->pool[lookup % ss->pool_size].be;
+        rq->be = hs->pool[lookup % hs->pool_size].be;
     } else {
         // else we have a direct id into our pool.
         // the lua modules should "think" in 1 based indexes, so we need to
         // subtract one here.
         // TODO: bother validating the range?
-        rq->be = ss->pool[lookup-1].be;
+        rq->be = hs->pool[lookup-1].be;
     }
 
     // now yield request, hash selector up.
@@ -2627,6 +2741,7 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     // TODO: __gc
     const struct luaL_Reg mcplib_backend_m[] = {
         {"set", NULL},
+        {"__gc", mcplib_backend_gc},
         {NULL, NULL}
     };
 
@@ -2644,9 +2759,14 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
         {NULL, NULL}
     };
 
-    // TODO: __gc
     const struct luaL_Reg mcplib_hash_selector_m[] = {
-        {"__call", mcplib_hash_selector_call},
+        {"__gc", mcplib_hash_selector_gc},
+        {NULL, NULL}
+    };
+
+    const struct luaL_Reg mcplib_hash_selector_proxy_m[] = {
+        {"__call", mcplib_hash_selector_proxy_call},
+        {"__gc", mcplib_hash_selector_proxy_gc},
         {NULL, NULL}
     };
 
@@ -2681,6 +2801,12 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     lua_pushvalue(L, -1); // duplicate metatable.
     lua_setfield(L, -2, "__index"); // mt.__index = mt
     luaL_setfuncs(L, mcplib_hash_selector_m, 0); // register methods
+    lua_pop(L, 1); // drop the hash selector metatable
+
+    luaL_newmetatable(L, "mcp.hash_selector_proxy");
+    lua_pushvalue(L, -1); // duplicate metatable.
+    lua_setfield(L, -2, "__index"); // mt.__index = mt
+    luaL_setfuncs(L, mcplib_hash_selector_proxy_m, 0); // register methods
     lua_pop(L, 1); // drop the hash selector metatable
 
     // create main library table.
