@@ -121,10 +121,10 @@ function failover_factory(zones, local_zone)
     end
     return function(r)
         local res = near_zone(r)
-        if res:ok() == false then
+        if res:hit() == false then
             for _, zone in pairs(far_zones) do
                 res = zone(r)
-                if res:ok() then
+                if res:hit() then
                     break
                 end
             end

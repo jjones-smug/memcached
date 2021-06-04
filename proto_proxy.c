@@ -2016,6 +2016,18 @@ static int mcplib_response_ok(lua_State *L) {
     return 1;
 }
 
+static int mcplib_response_hit(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+
+    if (r->status == MCMC_OK && r->resp.code != MCMC_CODE_MISS) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+
+    return 1;
+}
+
 static int mcplib_response_gc(lua_State *L) {
     mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
 
@@ -2785,6 +2797,7 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
 
     const struct luaL_Reg mcplib_response_m[] = {
         {"ok", mcplib_response_ok},
+        {"hit", mcplib_response_hit},
         {"__gc", mcplib_response_gc},
         {NULL, NULL}
     };
