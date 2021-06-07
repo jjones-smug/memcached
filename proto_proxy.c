@@ -2483,6 +2483,7 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
                 switch (cm[1]) {
                     case 'g':
                         cmd = CMD_MG;
+                        ret = _process_request_key(pr);
                         break;
                     case 's':
                         cmd = CMD_MS;
@@ -2492,12 +2493,14 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
                         break;
                     case 'd':
                         cmd = CMD_MD;
+                        ret = _process_request_key(pr);
                         break;
                     case 'n':
                         cmd = CMD_MN;
                         break;
                     case 'a':
                         cmd = CMD_MA;
+                        ret = _process_request_key(pr);
                         break;
                     case 'e':
                         cmd = CMD_ME;
