@@ -2382,6 +2382,43 @@ static int _process_request_key(mcp_parser_t *pr) {
     return 0;
 }
 
+// TODO: note TODO's from request_storage()
+static int _process_request_mset(mcp_parser_t *pr) {
+    const char *cur = pr->request + pr->parsed;
+    // see mcmc.c's _mcmc_parse_value_line() for the trick
+    // set <key> <datalen> <flags>*\r\n
+    if (!pr->has_space) {
+        return -1;
+    }
+
+    const char *s = memchr(cur, ' ', pr->reqlen - (pr->parsed + 2));
+    if (s != NULL) {
+        // Found another space, which means we at least have a key.
+        pr->key = cur - pr->request;
+        pr->klen = s - cur;
+        cur = s + 1;
+    } else {
+        return -1;
+    }
+
+    errno = 0;
+    char *n = NULL;
+    int vlen = strtol(cur, &n, 10);
+    if ((errno == ERANGE) || (cur == n)) {
+        return -1;
+    }
+    cur = n;
+
+    if (vlen < 0 || vlen > (INT_MAX - 2)) {
+       return -1;
+    }
+    vlen += 2;
+
+    pr->vlen = vlen;
+
+    return 0;
+}
+
 // TODO: error codes.
 static int _process_request_storage(mcp_parser_t *pr) {
     const char *cur = pr->request + pr->parsed;
@@ -2487,15 +2524,15 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
                         break;
                     case 's':
                         cmd = CMD_MS;
-                        // TODO: special mode to read data.
-                        // need to parse enough to know how to read.
-                        // ms <key> <flags>*\r\n
+                        ret = _process_request_mset(pr);
                         break;
                     case 'd':
                         cmd = CMD_MD;
                         ret = _process_request_key(pr);
                         break;
                     case 'n':
+                        // TODO: do we route/handle NOP's at all?
+                        // they should simply reflect to the client.
                         cmd = CMD_MN;
                         break;
                     case 'a':
