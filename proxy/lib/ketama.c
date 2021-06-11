@@ -208,6 +208,8 @@ static int ketama_new(lua_State *L) {
 
         }
 
+        free(hashstring);
+
         lua_pop(L, 1); // remove value, leave key for next iteration.
     }
 
