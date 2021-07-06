@@ -1745,6 +1745,12 @@ void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("badcrc_from_extstore", "%llu", (unsigned long long)thread_stats.badcrc_from_extstore);
     }
 #endif
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        APPEND_STAT("proxy_conn_requests", "%llu", (unsigned long long)thread_stats.proxy_conn_requests);
+        APPEND_STAT("proxy_conn_errors", "%llu", (unsigned long long)thread_stats.proxy_conn_errors);
+    }
+#endif
     APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
     APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
     APPEND_STAT("incr_misses", "%llu", (unsigned long long)thread_stats.incr_misses);
@@ -1798,6 +1804,9 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     STATS_UNLOCK();
 #ifdef EXTSTORE
     storage_stats(add_stats, c);
+#endif
+#ifdef PROXY
+    proxy_stats(add_stats, c);
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {

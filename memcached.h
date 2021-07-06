@@ -322,6 +322,12 @@ struct slab_stats {
     X(badcrc_from_extstore)
 #endif
 
+#ifdef PROXY
+#define PROXY_THREAD_STATS_FIELDS \
+    X(proxy_conn_requests) \
+    X(proxy_conn_errors)
+#endif
+
 /**
  * Stats stored per-thread.
  */
@@ -331,6 +337,9 @@ struct thread_stats {
     THREAD_STATS_FIELDS
 #ifdef EXTSTORE
     EXTSTORE_THREAD_STATS_FIELDS
+#endif
+#ifdef PROXY
+    PROXY_THREAD_STATS_FIELDS
 #endif
 #undef X
     struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];

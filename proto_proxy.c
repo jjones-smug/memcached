@@ -33,6 +33,27 @@
 #define P_DEBUG(...)
 #endif
 
+#define WSTAT_L(c) pthread_mutex_lock(&c->thread->stats.mutex);
+#define WSTAT_UL(c) pthread_mutex_unlock(&c->thread->stats.mutex);
+#define WSTAT_INCR(c, stat, amount) { \
+    pthread_mutex_lock(&c->thread->stats.mutex); \
+    c->thread->stats.stat += amount; \
+    pthread_mutex_unlock(&c->thread->stats.mutex); \
+}
+#define STAT_L(ctx) pthread_mutex_lock(&ctx->stats_lock);
+#define STAT_UL(ctx) pthread_mutex_unlock(&ctx->stats_lock);
+#define STAT_INCR(ctx, stat, amount) { \
+        pthread_mutex_lock(&ctx->stats_lock); \
+        ctx->global_stats.stat += amount; \
+        pthread_mutex_unlock(&ctx->stats_lock); \
+}
+
+#define STAT_DECR(ctx, stat, amount) { \
+        pthread_mutex_lock(&ctx->stats_lock); \
+        ctx->global_stats.stat -= amount; \
+        pthread_mutex_unlock(&ctx->stats_lock); \
+}
+
 // FIXME: do include dir properly.
 #include "vendor/mcmc/mcmc.h"
 
@@ -105,6 +126,16 @@ enum proxy_cmd_types {
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
 
+struct proxy_global_stats {
+    uint64_t config_reloads;
+    uint64_t config_reload_fails;
+    uint64_t backend_total;
+    uint64_t backend_disconn; // backends with no connections
+    uint64_t backend_requests; // reqs sent to backends
+    uint64_t backend_responses; // responses received from backends
+    uint64_t backend_errors; // errors from backends
+};
+
 typedef STAILQ_HEAD(hs_head_s, mcp_hash_selector_s) hs_head_t;
 typedef struct {
     lua_State *proxy_state;
@@ -121,6 +152,8 @@ typedef struct {
     hs_head_t manager_head; // stack for hash selector deallocation.
     bool worker_done; // signal variable for the worker lock/cond system.
     bool worker_failed; // covered by worker_lock as well.
+    struct proxy_global_stats global_stats;
+    pthread_mutex_t stats_lock;
 } proxy_ctx_t;
 
 struct proxy_hook {
@@ -323,6 +356,22 @@ static int proxy_thread_loadconf(LIBEVENT_THREAD *thr);
 /******** EXTERNAL FUNCTIONS ******/
 // functions starting with _ are breakouts for the public functions.
 
+// see also: process_extstore_stats()
+// FIXME: get context off of conn? global variables
+// FIXME: stat coverage
+void proxy_stats(ADD_STAT add_stats, conn *c) {
+    if (!settings.proxy_enabled) {
+       return;
+    }
+    proxy_ctx_t *ctx = settings.proxy_ctx;
+    STAT_L(ctx);
+
+    APPEND_STAT("proxy_config_reloads", "%llu", (unsigned long long)ctx->global_stats.config_reloads);
+    APPEND_STAT("proxy_config_reload_fails", "%llu", (unsigned long long)ctx->global_stats.config_reload_fails);
+    APPEND_STAT("proxy_backend_total", "%llu", (unsigned long long)ctx->global_stats.backend_total);
+    STAT_UL(ctx);
+}
+
 struct _dumpbuf {
     size_t size;
     size_t used;
@@ -426,6 +475,7 @@ static void *_proxy_config_thread(void *arg) {
     pthread_mutex_lock(&ctx->config_lock);
     while (1) {
         pthread_cond_wait(&ctx->config_cond, &ctx->config_lock);
+        STAT_INCR(ctx, config_reloads, 1);
         lua_State *L = ctx->proxy_state;
         lua_settop(L, 0); // clear off any crud that could have been left on the stack.
 
@@ -439,6 +489,7 @@ static void *_proxy_config_thread(void *arg) {
 
         if (proxy_load_config(ctx) != 0) {
             // TODO: Failed to load. log and wait for a retry.
+            STAT_INCR(ctx, config_reload_fails, 1);
             continue;
         }
 
@@ -459,6 +510,7 @@ static void *_proxy_config_thread(void *arg) {
             if (write(thr->notify_send_fd, buf, 1) != 1) {
                 perror("Failed writing to nofiy pipe");
                 pthread_mutex_unlock(&ctx->worker_lock);
+                STAT_INCR(ctx, config_reload_fails, 1);
                 continue;
             }
             while (!ctx->worker_done) {
@@ -469,6 +521,7 @@ static void *_proxy_config_thread(void *arg) {
 
             // Code load bailed.
             if (ctx->worker_failed) {
+                STAT_INCR(ctx, config_reload_fails, 1);
                 continue;
             }
         }
@@ -515,6 +568,7 @@ void proxy_init(void) {
     pthread_cond_init(&ctx->worker_cond, NULL);
     pthread_mutex_init(&ctx->manager_lock, NULL);
     pthread_cond_init(&ctx->manager_cond, NULL);
+    pthread_mutex_init(&ctx->stats_lock, NULL);
     STAILQ_INIT(&ctx->manager_head);
     lua_State *L = luaL_newstate();
     ctx->proxy_state = L;
@@ -1771,6 +1825,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     // permanent solution.
     int ret = process_request(&pr, command, cmdlen);
     if (ret != 0) {
+        WSTAT_INCR(c, proxy_conn_errors, 1);
         if (!resp_start(c)) {
             conn_set_state(c, conn_closing);
             return;
@@ -1801,6 +1856,9 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
         process_command_ascii(c, command);
         return;
     }
+
+    // Count requests handled by proxy vs local.
+    WSTAT_INCR(c, proxy_conn_requests, 1);
 
     // If ascii multiget, we turn this into a self-calling loop :(
     // create new request with next key, call this func again, then advance

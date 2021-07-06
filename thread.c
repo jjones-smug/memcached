@@ -894,6 +894,9 @@ void threadlocal_stats_reset(void) {
 #ifdef EXTSTORE
         EXTSTORE_THREAD_STATS_FIELDS
 #endif
+#ifdef PROXY
+        PROXY_THREAD_STATS_FIELDS
+#endif
 #undef X
 
         memset(&threads[ii].stats.slab_stats, 0,
@@ -918,6 +921,9 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
         THREAD_STATS_FIELDS
 #ifdef EXTSTORE
         EXTSTORE_THREAD_STATS_FIELDS
+#endif
+#ifdef PROXY
+        PROXY_THREAD_STATS_FIELDS
 #endif
 #undef X
 
