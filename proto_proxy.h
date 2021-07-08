@@ -2,6 +2,7 @@
 #define PROTO_PROXY_H
 
 void proxy_stats(ADD_STAT add_stats, conn *c);
+void process_proxy_stats(ADD_STAT add_stats, conn *c);
 
 /* proxy mode handlers */
 int try_read_command_proxy(conn *c);

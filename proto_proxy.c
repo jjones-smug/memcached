@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include <lua.h>
 #include <lualib.h>
@@ -33,8 +34,8 @@
 #define P_DEBUG(...)
 #endif
 
-#define WSTAT_L(c) pthread_mutex_lock(&c->thread->stats.mutex);
-#define WSTAT_UL(c) pthread_mutex_unlock(&c->thread->stats.mutex);
+#define WSTAT_L(t) pthread_mutex_lock(&t->stats.mutex);
+#define WSTAT_UL(t) pthread_mutex_unlock(&t->stats.mutex);
 #define WSTAT_INCR(c, stat, amount) { \
     pthread_mutex_lock(&c->thread->stats.mutex); \
     c->thread->stats.stat += amount; \
@@ -126,6 +127,12 @@ enum proxy_cmd_types {
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
 
+struct proxy_user_stats {
+    size_t num_stats; // number of stats, for sizing various arrays
+    char **names; // not needed for worker threads
+    uint64_t *counters; // array of counters.
+};
+
 struct proxy_global_stats {
     uint64_t config_reloads;
     uint64_t config_reload_fails;
@@ -153,7 +160,8 @@ typedef struct {
     bool worker_done; // signal variable for the worker lock/cond system.
     bool worker_failed; // covered by worker_lock as well.
     struct proxy_global_stats global_stats;
-    pthread_mutex_t stats_lock;
+    struct proxy_user_stats user_stats;
+    pthread_mutex_t stats_lock; // used for rare global counters
 } proxy_ctx_t;
 
 struct proxy_hook {
@@ -369,6 +377,39 @@ void proxy_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("proxy_config_reloads", "%llu", (unsigned long long)ctx->global_stats.config_reloads);
     APPEND_STAT("proxy_config_reload_fails", "%llu", (unsigned long long)ctx->global_stats.config_reload_fails);
     APPEND_STAT("proxy_backend_total", "%llu", (unsigned long long)ctx->global_stats.backend_total);
+    STAT_UL(ctx);
+}
+
+void process_proxy_stats(ADD_STAT add_stats, conn *c) {
+    char key_str[STAT_KEY_LEN];
+
+    if (!settings.proxy_enabled) {
+        return;
+    }
+    proxy_ctx_t *ctx = settings.proxy_ctx;
+    STAT_L(ctx);
+
+    // prepare aggregated counters.
+    struct proxy_user_stats *us = &ctx->user_stats;
+    uint64_t counters[us->num_stats];
+    memset(counters, 0, sizeof(counters));
+
+    // aggregate worker thread counters.
+    for (int x = 0; x < settings.num_threads; x++) {
+        LIBEVENT_THREAD *t = get_worker_thread(x);
+        struct proxy_user_stats *tus = t->proxy_stats;
+        WSTAT_L(t);
+        for (int i = 0; i < tus->num_stats; i++) {
+            counters[i] += tus->counters[i];
+        }
+        WSTAT_UL(t);
+    }
+
+    // return all of the stats
+    for (int x = 0; x < us->num_stats; x++) {
+        snprintf(key_str, STAT_KEY_LEN-1, "user_%s", us->names[x]);
+        APPEND_STAT(key_str, "%llu", (unsigned long long)counters[x]);
+    }
     STAT_UL(ctx);
 }
 
@@ -809,6 +850,35 @@ static int proxy_thread_loadconf(LIBEVENT_THREAD *thr) {
         fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
         return -1;
     }
+
+    // update user stats
+    STAT_L(ctx);
+    struct proxy_user_stats *us = &ctx->user_stats;
+    struct proxy_user_stats *tus = NULL;
+    if (us->num_stats != 0) {
+        pthread_mutex_lock(&thr->stats.mutex);
+        if (thr->proxy_stats == NULL) {
+            tus = calloc(1, sizeof(struct proxy_user_stats));
+            thr->proxy_stats = tus;
+        }
+
+        // originally this was a realloc routine but it felt fragile.
+        // that might still be a better idea; still need to zero out the end.
+        uint64_t *counters = calloc(us->num_stats, sizeof(uint64_t));
+
+        // note that num_stats can _only_ grow in size.
+        // we also only care about counters on the worker threads.
+        if (tus->counters) {
+            assert(tus->num_stats <= us->num_stats);
+            memcpy(counters, tus->counters, tus->num_stats * sizeof(uint64_t));
+            free(tus->counters);
+        }
+
+        tus->counters = counters;
+        tus->num_stats = us->num_stats;
+        pthread_mutex_unlock(&thr->stats.mutex);
+    }
+    STAT_UL(ctx);
 
     return 0;
 }
@@ -2872,6 +2942,107 @@ static int mcplib_open_jump_hash(lua_State *L) {
 
 /*** END jump consistent hash library ***/
 
+/*** START lua interface to user stats ***/
+
+// mcp.add_stat(index, name)
+// creates a custom lua stats counter
+static int mcplib_add_stat(lua_State *L) {
+    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
+    if (t != NULL) {
+        proxy_lua_error(L, "add_stat must be called from config_selectors");
+        return 0;
+    }
+    int idx = luaL_checkinteger(L, -2);
+    const char *name = luaL_checkstring(L, -1);
+
+    if (idx < 1) {
+        proxy_lua_error(L, "stat index must be 1 or higher");
+        return 0;
+    }
+    // max user counters? 1024? some weird number.
+    if (idx > 1024) {
+        proxy_lua_error(L, "stat index must be 1024 or less");
+        return 0;
+    }
+    // max name length? avoids errors if something huge gets thrown in.
+    if (strlen(name) > STAT_KEY_LEN - 6) {
+        // we prepend "user_" to the output. + null byte.
+        proxy_lua_ferror(L, "stat name too long: %s\n", name);
+        return 0;
+    }
+    // restrict characters, at least no spaces/newlines.
+    for (int x = 0; x < strlen(name); x++) {
+        if (isspace(name[x])) {
+            proxy_lua_error(L, "stat cannot contain spaces or newlines");
+            return 0;
+        }
+    }
+
+    proxy_ctx_t *ctx = settings.proxy_ctx; // TODO: store ctx in upvalue.
+
+    // just to save some typing.
+    STAT_L(ctx);
+    struct proxy_user_stats *us = &ctx->user_stats;
+
+    // if num_stats is 0 we need to init sizes.
+    // TODO: malloc fail checking.
+    if (us->num_stats < idx) {
+        // don't allocate counters memory for the global ctx.
+        char **nnames = calloc(idx, sizeof(char *));
+        if (us->names != NULL) {
+            for (int x = 0; x < us->num_stats; x++) {
+                nnames[x] = us->names[x];
+            }
+            free(us->names);
+        }
+        us->names = nnames;
+        us->num_stats = idx;
+    }
+
+    idx--; // real slot start as 0.
+    // if slot has string in it, free first
+    if (us->names[idx] != NULL) {
+        free(us->names[idx]);
+    }
+    // strdup name into string slot
+    // TODO: malloc failure.
+    us->names[idx] = strdup(name);
+    STAT_UL(ctx);
+
+    return 0;
+}
+
+static int mcplib_stat(lua_State *L) {
+    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
+    if (t == NULL) {
+        proxy_lua_error(L, "stat must be called from router handlers");
+        return 0;
+    }
+
+    struct proxy_user_stats *tus = t->proxy_stats;
+    if (tus == NULL) {
+        proxy_lua_error(L, "no stats counters initialized");
+        return 0;
+    }
+
+    int idx = luaL_checkinteger(L, -2);
+    int change = luaL_checkinteger(L, -1);
+
+    if (idx < 1 || idx > tus->num_stats) {
+        proxy_lua_error(L, "stat index out of range");
+        return 0;
+    }
+
+    idx--; // actual array is 0 indexed.
+    WSTAT_L(t);
+    tus->counters[idx] += change;
+    WSTAT_UL(t);
+
+    return 0;
+}
+
+/*** END lua interface to user stats ***/
+
 // Creates and returns the top level "mcp" module
 int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     lua_State *L = ctx;
@@ -2916,6 +3087,8 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
         {"backend", mcplib_backend},
         {"request", mcplib_request},
         {"attach", mcplib_attach},
+        {"add_stat", mcplib_add_stat},
+        {"stat", mcplib_stat},
         {NULL, NULL}
     };
 

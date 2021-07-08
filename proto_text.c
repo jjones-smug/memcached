@@ -5,6 +5,10 @@
 
 #include "memcached.h"
 #include "proto_text.h"
+// FIXME: only for process_proxy_stats()
+// - some better/different structure for stats subcommands
+// would remove this abstraction leak.
+#include "proto_proxy.h"
 #include "authfile.h"
 #include "storage.h"
 #include "base64.h"
@@ -778,6 +782,10 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 #ifdef EXTSTORE
     } else if (strcmp(subcommand, "extstore") == 0) {
         process_extstore_stats(&append_stats, c);
+#endif
+#ifdef PROXY
+    } else if (strcmp(subcommand, "proxy") == 0) {
+        process_proxy_stats(&append_stats, c);
 #endif
     } else {
         /* getting here means that the subcommand is either engine specific or

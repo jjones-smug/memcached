@@ -8,7 +8,12 @@
 -- doing so allows all configuration files to be identical, simplifying consistency checks.
 local my_zone = 'z1'
 
+local STAT_EXAMPLE <const> = 1
+local STAT_ANOTHER <const> = 2
+
 function mcp_config_selectors(oldss)
+    mcp.add_stat(STAT_EXAMPLE, "example")
+    mcp.add_stat(STAT_ANOTHER, "another")
     -- alias mcp.backend for convenience.
     -- important to alias global variables in routes where speed is concerned.
     local srv = mcp.backend
@@ -165,9 +170,12 @@ function prefix_factory(pattern, list, default)
     local p = pattern
     local l = list
     local d = default
+    local s = mcp.stat
     return function(r)
         local route = l[string.match(r:key(), p)]
         if route == nil then
+            -- example counter: tick when default route hit.
+            s(EXAMPLE_STAT, 1)
             return d(r)
         end
         return route(r)
